@@ -1,8 +1,12 @@
 """3-stage LLM Council orchestration."""
 
+import logging
+from time import perf_counter
 from typing import List, Dict, Any, Tuple
 from .openrouter import query_models_parallel, query_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+
+logger = logging.getLogger("uvicorn.error")
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -15,7 +19,13 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     Returns:
         List of dicts with 'model' and 'response' keys
     """
+    start = perf_counter()
     messages = [{"role": "user", "content": user_query}]
+    logger.info(
+        "council.stage1.start model_count=%d question_chars=%d",
+        len(COUNCIL_MODELS),
+        len(user_query),
+    )
 
     # Query all models in parallel
     responses = await query_models_parallel(COUNCIL_MODELS, messages)
@@ -28,6 +38,14 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
                 "model": model,
                 "response": response.get('content', '')
             })
+
+    elapsed = perf_counter() - start
+    logger.info(
+        "council.stage1.done success=%d failed=%d elapsed_s=%.2f",
+        len(stage1_results),
+        len(COUNCIL_MODELS) - len(stage1_results),
+        elapsed,
+    )
 
     return stage1_results
 
@@ -46,6 +64,12 @@ async def stage2_collect_rankings(
     Returns:
         Tuple of (rankings list, label_to_model mapping)
     """
+    start = perf_counter()
+    logger.info(
+        "council.stage2.start stage1_response_count=%d",
+        len(stage1_results),
+    )
+
     # Create anonymized labels for responses (Response A, Response B, etc.)
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
@@ -109,6 +133,14 @@ Now provide your evaluation and ranking:"""
                 "parsed_ranking": parsed
             })
 
+    elapsed = perf_counter() - start
+    logger.info(
+        "council.stage2.done success=%d failed=%d elapsed_s=%.2f",
+        len(stage2_results),
+        len(COUNCIL_MODELS) - len(stage2_results),
+        elapsed,
+    )
+
     return stage2_results, label_to_model
 
 
@@ -128,6 +160,14 @@ async def stage3_synthesize_final(
     Returns:
         Dict with 'model' and 'response' keys
     """
+    start = perf_counter()
+    logger.info(
+        "council.stage3.start chairman_model=%s stage1_count=%d stage2_count=%d",
+        CHAIRMAN_MODEL,
+        len(stage1_results),
+        len(stage2_results),
+    )
+
     # Build comprehensive context for chairman
     stage1_text = "\n\n".join([
         f"Model: {result['model']}\nResponse: {result['response']}"
@@ -163,10 +203,22 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     if response is None:
         # Fallback if chairman fails
+        elapsed = perf_counter() - start
+        logger.warning(
+            "council.stage3.done success=false elapsed_s=%.2f",
+            elapsed,
+        )
         return {
             "model": CHAIRMAN_MODEL,
             "response": "Error: Unable to generate final synthesis."
         }
+
+    elapsed = perf_counter() - start
+    logger.info(
+        "council.stage3.done success=true elapsed_s=%.2f response_chars=%d",
+        elapsed,
+        len(response.get("content", "") or ""),
+    )
 
     return {
         "model": CHAIRMAN_MODEL,
@@ -265,6 +317,13 @@ async def generate_conversation_title(user_query: str) -> str:
     Returns:
         A short title (3-5 words)
     """
+    start = perf_counter()
+    logger.info(
+        "council.title.start model=%s question_chars=%d",
+        CHAIRMAN_MODEL,
+        len(user_query),
+    )
+
     title_prompt = f"""Generate a very short title (3-5 words maximum) that summarizes the following question.
 The title should be concise and descriptive. Do not use quotes or punctuation in the title.
 
@@ -274,11 +333,16 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    # Use configured chairman model for title generation
+    response = await query_model(CHAIRMAN_MODEL, messages, timeout=30.0)
 
     if response is None:
         # Fallback to a generic title
+        elapsed = perf_counter() - start
+        logger.warning(
+            "council.title.done success=false elapsed_s=%.2f fallback=New Conversation",
+            elapsed,
+        )
         return "New Conversation"
 
     title = response.get('content', 'New Conversation').strip()
@@ -289,6 +353,13 @@ Title:"""
     # Truncate if too long
     if len(title) > 50:
         title = title[:47] + "..."
+
+    elapsed = perf_counter() - start
+    logger.info(
+        "council.title.done success=true elapsed_s=%.2f title=%s",
+        elapsed,
+        title,
+    )
 
     return title
 
@@ -303,11 +374,23 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
+    start = perf_counter()
+    logger.info(
+        "council.run.start model_count=%d chairman_model=%s",
+        len(COUNCIL_MODELS),
+        CHAIRMAN_MODEL,
+    )
+
     # Stage 1: Collect individual responses
     stage1_results = await stage1_collect_responses(user_query)
 
     # If no models responded successfully, return error
     if not stage1_results:
+        elapsed = perf_counter() - start
+        logger.warning(
+            "council.run.done success=false reason=no_stage1_responses elapsed_s=%.2f",
+            elapsed,
+        )
         return [], [], {
             "model": "error",
             "response": "All models failed to respond. Please try again."
@@ -331,5 +414,14 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         "label_to_model": label_to_model,
         "aggregate_rankings": aggregate_rankings
     }
+
+    elapsed = perf_counter() - start
+    logger.info(
+        "council.run.done success=true stage1=%d stage2=%d stage3_model=%s elapsed_s=%.2f",
+        len(stage1_results),
+        len(stage2_results),
+        stage3_result.get("model", "unknown"),
+        elapsed,
+    )
 
     return stage1_results, stage2_results, stage3_result, metadata

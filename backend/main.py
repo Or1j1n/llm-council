@@ -1,16 +1,28 @@
 """FastAPI backend for LLM Council."""
 
+import asyncio
+import json
+import logging
+import os
+from time import perf_counter
+import uuid
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any
-import uuid
-import json
-import asyncio
 
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+VALID_UVICORN_LOG_LEVELS = {"critical", "error", "warning", "info", "debug", "trace"}
+UVICORN_LOG_LEVEL = LOG_LEVEL.lower()
+if UVICORN_LOG_LEVEL not in VALID_UVICORN_LOG_LEVELS:
+    UVICORN_LOG_LEVEL = "info"
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="LLM Council API")
 
@@ -85,9 +97,24 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     Send a message and run the 3-stage council process.
     Returns the complete response with all stages.
     """
+    request_id = str(uuid.uuid4())[:8]
+    request_start = perf_counter()
+
+    logger.info(
+        "api.request.start id=%s endpoint=/api/conversations/%s/message content_chars=%d",
+        request_id,
+        conversation_id,
+        len(request.content),
+    )
+
     # Check if conversation exists
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
+        logger.warning(
+            "api.request.not_found id=%s conversation_id=%s",
+            request_id,
+            conversation_id,
+        )
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Check if this is the first message
@@ -98,12 +125,28 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
 
     # If this is the first message, generate a title
     if is_first_message:
+        title_start = perf_counter()
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
+        logger.info(
+            "api.request.title_generated id=%s elapsed_s=%.2f title=%s",
+            request_id,
+            perf_counter() - title_start,
+            title,
+        )
 
     # Run the 3-stage council process
+    council_start = perf_counter()
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
         request.content
+    )
+    logger.info(
+        "api.request.council_done id=%s elapsed_s=%.2f stage1=%d stage2=%d stage3_model=%s",
+        request_id,
+        perf_counter() - council_start,
+        len(stage1_results),
+        len(stage2_results),
+        stage3_result.get("model", "unknown"),
     )
 
     # Add assistant message with all stages
@@ -115,6 +158,14 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     )
 
     # Return the complete response with metadata
+    total_elapsed = perf_counter() - request_start
+    logger.info(
+        "api.request.done id=%s endpoint=/api/conversations/%s/message elapsed_s=%.2f",
+        request_id,
+        conversation_id,
+        total_elapsed,
+    )
+
     return {
         "stage1": stage1_results,
         "stage2": stage2_results,
@@ -129,9 +180,23 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     Send a message and stream the 3-stage council process.
     Returns Server-Sent Events as each stage completes.
     """
+    request_id = str(uuid.uuid4())[:8]
+    request_start = perf_counter()
+    logger.info(
+        "api.stream.start id=%s endpoint=/api/conversations/%s/message/stream content_chars=%d",
+        request_id,
+        conversation_id,
+        len(request.content),
+    )
+
     # Check if conversation exists
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
+        logger.warning(
+            "api.stream.not_found id=%s conversation_id=%s",
+            request_id,
+            conversation_id,
+        )
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Check if this is the first message
@@ -148,25 +213,51 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
             # Stage 1: Collect responses
+            stage_start = perf_counter()
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
             stage1_results = await stage1_collect_responses(request.content)
+            logger.info(
+                "api.stream.stage_done id=%s stage=1 elapsed_s=%.2f count=%d",
+                request_id,
+                perf_counter() - stage_start,
+                len(stage1_results),
+            )
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
             # Stage 2: Collect rankings
+            stage_start = perf_counter()
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+            logger.info(
+                "api.stream.stage_done id=%s stage=2 elapsed_s=%.2f count=%d",
+                request_id,
+                perf_counter() - stage_start,
+                len(stage2_results),
+            )
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
             # Stage 3: Synthesize final answer
+            stage_start = perf_counter()
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            logger.info(
+                "api.stream.stage_done id=%s stage=3 elapsed_s=%.2f model=%s",
+                request_id,
+                perf_counter() - stage_start,
+                stage3_result.get("model", "unknown"),
+            )
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started
             if title_task:
                 title = await title_task
                 storage.update_conversation_title(conversation_id, title)
+                logger.info(
+                    "api.stream.title_generated id=%s title=%s",
+                    request_id,
+                    title,
+                )
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
 
             # Save complete assistant message
@@ -178,9 +269,21 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             )
 
             # Send completion event
+            logger.info(
+                "api.stream.done id=%s endpoint=/api/conversations/%s/message/stream elapsed_s=%.2f",
+                request_id,
+                conversation_id,
+                perf_counter() - request_start,
+            )
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
+            logger.exception(
+                "api.stream.error id=%s conversation_id=%s error=%s",
+                request_id,
+                conversation_id,
+                str(e),
+            )
             # Send error event
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
@@ -196,4 +299,4 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level=UVICORN_LOG_LEVEL)
